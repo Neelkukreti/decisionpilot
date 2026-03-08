@@ -1,0 +1,23 @@
+# Day 1 - Minimal dependencies (Knowledge Layer only)
+# Using latest versions for Python 3.14 compatibility
+
+# Core Framework
+fastapi
+uvicorn[standard]
+python-dotenv
+pydantic>=2.10  # Latest for Python 3.14 support
+
+# AWS & Bedrock
+boto3
+
+# Utilities
+httpx
+aiofiles
+python-multipart
+
+# Scientific computing (for retrieval service)
+numpy
+
+# Testing
+pytest
+pytest-asyncio

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <!-- Dark rounded background -->
+  <rect width="32" height="32" rx="7" fill="#0F172A"/>
+  <!-- Green lightning bolt -->
+  <path d="M19 4L10 18h7l-4 10 13-16h-7l4-8z" fill="#22C55E" stroke="#22C55E" stroke-width="0.5" stroke-linejoin="round"/>
+</svg>
