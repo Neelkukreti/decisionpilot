@@ -5,6 +5,7 @@ Main application entry point
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from typing import List, Optional
 import config
 import os
@@ -157,6 +158,112 @@ async def analyze_meeting(meeting_id: str, background_tasks: BackgroundTasks):
     }
     background_tasks.add_task(run_analysis_pipeline, meeting_id)
     return {'meeting_id': meeting_id, 'status': 'started'}
+
+
+# ── Missed Commitment Detection ───────────────────────────────────────────────
+# Vague patterns with confidence: phrases that sound like commitments but lack
+# the specificity to pass the quality gate.
+_VAGUE_PATTERNS = [
+    (r"\bI['']ll (?:probably |maybe |try to |just |quickly )?\w+(?:\s+\w+){1,8}", 'medium'),
+    (r"\bwe should (?:probably |maybe |try to )?\w+(?:\s+\w+){0,6}", 'low'),
+    (r"\bsomeon(?:e|eone) should \w+(?:\s+\w+){0,6}", 'low'),
+    (r"\bmaybe we (?:can|could|should|ought to) \w+(?:\s+\w+){0,6}", 'low'),
+    (r"\bI['']ll (?:check|look into|follow up|get back|reach out|circle back|ping)\b.{0,60}", 'medium'),
+    (r"\bwe(?:'ll| will) figure (?:out|this)\b.{0,50}", 'low'),
+    (r"\bwe need to \w+(?:\s+\w+){0,6}", 'medium'),
+    (r"\bsomebody (?:should|needs to|has to|ought to) \w+(?:\s+\w+){0,6}", 'low'),
+    (r"\bI should (?:probably |maybe )?\w+(?:\s+\w+){0,6}", 'low'),
+    (r"\bshould (?:probably|maybe) \w+(?:\s+\w+){0,6}", 'low'),
+    (r"\blet'?s (?:try to |maybe |probably )?\w+(?:\s+\w+){0,6}", 'low'),
+    (r"\bwe(?:'ll| will) (?:take a look|revisit|discuss|review|check) .{5,60}", 'medium'),
+]
+
+def detect_missed_commitments(
+    transcript_text: str,
+    participants: list,
+    action_items: list,
+) -> list:
+    """Detect vague commitments that didn't pass the quality gate."""
+    if not transcript_text:
+        return []
+
+    # Titles of real action items — avoid double-counting
+    real_titles = {a.get('title', '').lower()[:50] for a in action_items}
+    participant_names = [p['name'] for p in participants]
+
+    commitments = []
+    seen_sentences: set = set()
+
+    # Split into sentences
+    sentences = re.split(r'(?<=[.!?])\s+', transcript_text)
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if len(sentence) < 20 or len(sentence) > 250:
+            continue
+        key = sentence.lower()[:50]
+        if key in seen_sentences:
+            continue
+
+        for pattern, confidence in _VAGUE_PATTERNS:
+            if not re.search(pattern, sentence, re.IGNORECASE):
+                continue
+
+            # Skip if it duplicates a real action
+            if any(key in t or t in key for t in real_titles if len(t) > 15):
+                break
+
+            seen_sentences.add(key)
+
+            # Infer owner: scan for participant names in or near sentence
+            owner = None
+            ctx = transcript_text
+            pos = ctx.lower().find(sentence.lower()[:30])
+            surrounding = ctx[max(0, pos - 80):pos + len(sentence) + 10] if pos >= 0 else sentence
+            for name in participant_names:
+                if name.split()[0].lower() in surrounding.lower():
+                    owner = name
+                    break
+            # If "I'll" → speaker is implicit owner (mark as inferred)
+            first_person = bool(re.search(r"\bI[''](?:ll|ve|m)\b|\bI (?:will|should|need)\b", sentence, re.I))
+            if first_person and not owner and participant_names:
+                owner = participant_names[0]  # best-effort: first participant
+
+            # Determine missing fields
+            has_deadline = bool(re.search(
+                r'\b(?:by|before|until|on|next|tomorrow|today|this week|end of|Monday|Tuesday|Wednesday|Thursday|Friday|March|April|next month)\b',
+                sentence, re.I,
+            ))
+            missing = []
+            if not has_deadline:
+                missing.append('deadline')
+            if not owner and not first_person:
+                missing.append('owner')
+            if len(sentence.split()) < 6:
+                missing.append('clarity')
+
+            reason_parts = []
+            if 'deadline' in missing:
+                reason_parts.append('No explicit deadline detected')
+            if 'owner' in missing:
+                reason_parts.append('No named owner could be identified')
+            if 'clarity' in missing:
+                reason_parts.append('Action too vague to act on')
+
+            commitments.append({
+                'commitment_id': f'MC-{len(commitments)+1:03d}',
+                'sentence': sentence[:180],
+                'inferred_owner': owner,
+                'confidence': confidence,
+                'missing_fields': missing,
+                'reason': '. '.join(reason_parts) or 'Vague language detected',
+            })
+            break  # one pattern per sentence
+
+        if len(commitments) >= 6:
+            break
+
+    return commitments
 
 
 async def run_analysis_pipeline(meeting_id: str):
@@ -397,6 +504,20 @@ async def run_analysis_pipeline(meeting_id: str):
                 'blocked_reasons':       routing.get('blocked_reasons', []),
             })
 
+        # ── Missed commitment detection ────────────────────────────────────
+        all_participants = _build_participants(action_items_fmt, decisions_fmt, open_qs or [], risks or [])
+        missed_commitments = detect_missed_commitments(
+            transcript_text or '',
+            all_participants,
+            action_items_fmt,
+        )
+
+        # ── Has audio? ─────────────────────────────────────────────────────
+        has_audio = any(
+            f.lower().endswith(('.mp3', '.mp4', '.wav', '.m4a', '.flac', '.ogg', '.webm'))
+            for f in os.listdir(meeting_dir)
+        )
+
         # ── Done ──────────────────────────────────────────────────────────
         analysis_results[meeting_id].update({
             'status':            'complete',
@@ -434,7 +555,9 @@ async def run_analysis_pipeline(meeting_id: str):
                 }
                 for i, r in enumerate(risks or [])
             ],
-            'participants':      _build_participants(action_items_fmt, decisions_fmt, open_qs or [], risks or []),
+            'participants':      all_participants,
+            'missed_commitments': missed_commitments,
+            'has_audio':         has_audio,
             'routing_summary':   routing_summary,
             'transcript_preview': transcript_text[:500] if transcript_text else None,
             'agents_used':       (
@@ -540,6 +663,22 @@ async def get_meeting_status(meeting_id: str):
     return {'meeting_id': meeting_id, 'stage': 'not_started', 'progress': 0}
 
 
+@app.get('/api/meetings/{meeting_id}/audio')
+async def get_meeting_audio(meeting_id: str):
+    """Serve the uploaded audio file for a meeting (used by Evidence Playback)."""
+    meeting_dir = os.path.join(config.UPLOAD_DIR, meeting_id)
+    if not os.path.isdir(meeting_dir):
+        raise HTTPException(status_code=404, detail='Meeting not found')
+    for fname in os.listdir(meeting_dir):
+        if fname.lower().endswith(('.mp3', '.mp4', '.wav', '.m4a', '.flac', '.ogg', '.webm')):
+            ext = fname.rsplit('.', 1)[-1].lower()
+            mime = {'mp3': 'audio/mpeg', 'mp4': 'video/mp4', 'wav': 'audio/wav',
+                    'm4a': 'audio/mp4', 'flac': 'audio/flac', 'ogg': 'audio/ogg',
+                    'webm': 'audio/webm'}.get(ext, 'audio/mpeg')
+            return FileResponse(os.path.join(meeting_dir, fname), media_type=mime)
+    raise HTTPException(status_code=404, detail='No audio file found for this meeting')
+
+
 def _build_participants(action_items, decisions, open_qs, risks) -> list:
     """Collect all named people from the meeting output, with their roles."""
     from collections import defaultdict
@@ -550,6 +689,9 @@ def _build_participants(action_items, decisions, open_qs, risks) -> list:
         'tbd', 'n/a', 'unassigned', 'null', '???', '', 'selected', 'locked',
         'approved', 'rejected', 'pending', 'all', 'everyone', 'nobody',
         'the team', 'our team', 'management', 'leadership',
+        # Transcribe diarization false positives (spoken words mistaken for names)
+        'confirmed', 'agreed', 'understood', 'correct', 'right', 'okay', 'yes', 'noted',
+        'done', 'sure', 'absolutely', 'exactly', 'perfect', 'great', 'good',
     }
     def clean(name):
         if not name: return None
